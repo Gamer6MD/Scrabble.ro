@@ -16,30 +16,34 @@ firebase_config_raw = os.environ.get("__firebase_config", "{}")
 firebase_config = json.loads(firebase_config_raw)
 app_id = os.environ.get("__app_id", "scrabble-ro")
 
-# Initializam Firebase Admin folosind configuratia din variabilele de mediu
+# Initializam Firebase Admin
 try:
     if not firebase_admin._apps:
-        # Extragem Project ID din config-ul tau de web
         project_id = firebase_config.get("projectId")
         
-        # Pe Vercel, cand folosim Admin SDK fara fisier .json, 
-        # trebuie sa initializam cu optiunile de proiect
-        cred = credentials.ApplicationDefault()
-        
-        # Daca ApplicationDefault esueaza (cazul tau), folosim o metoda care
-        # permite initializarea fara fisier de chei daca suntem in modul citire/scriere public
-        firebase_admin.initialize_app(options={
-            'projectId': project_id,
-        })
-        logging.info("Firebase initialized with Project ID")
+        if project_id:
+            # Incercam initializarea fara certificat (doar cu Project ID)
+            # Aceasta functioneaza pe Vercel daca regulile Firestore permit accesul 
+            # sau daca sunt setate permisiunile IAM corespunzatoare.
+            firebase_admin.initialize_app(options={
+                'projectId': project_id,
+            })
+            logging.info(f"Firebase initialized with Project ID: {project_id}")
+        else:
+            # Fallback la initializarea default daca nu gasim project_id in JSON
+            firebase_admin.initialize_app()
+            logging.info("Firebase initialized with default credentials")
     
     db = firestore.client()
 except Exception as e:
     logging.error(f"Eroare critica la initializarea Firebase: {e}")
-    # Fallback: Incearca initializarea goala (pentru medii care au ADC setat)
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app()
-    db = firestore.client()
+    # Incercam o ultima varianta de fallback
+    try:
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app()
+        db = firestore.client()
+    except Exception as e2:
+        logging.error(f"Fallback-ul final a esuat: {e2}")
 
 # --- CONSTANTE JOC ---
 LETTER_DISTRIBUTION = {
@@ -51,7 +55,8 @@ LETTER_DISTRIBUTION = {
 }
 
 def get_session_doc(session_id):
-    return db.document(f"artifacts/{app_id}/public/data/sessions/{session_id}")
+    # Folosim direct db pentru a accesa documentul
+    return db.collection('artifacts').document(app_id).collection('public').document('data').collection('sessions').document(session_id)
 
 def create_initial_state(player_name, player_id):
     bag = []
@@ -84,58 +89,66 @@ def create_session():
     if request.method == 'GET':
         return jsonify({"message": "Foloseste POST pentru a crea o sesiune"}), 405
         
-    data = request.json or {}
-    player_name = data.get('name', 'Player')
-    player_id = data.get('player_id') or str(uuid.uuid4())
-    session_id = str(uuid.uuid4())[:8]
-    
     try:
+        data = request.json or {}
+        player_name = data.get('name', 'Player')
+        player_id = data.get('player_id') or str(uuid.uuid4())
+        session_id = str(uuid.uuid4())[:8]
+        
         state = create_initial_state(player_name, player_id)
         get_session_doc(session_id).set(state)
         return jsonify({"session_id": session_id, "player_id": player_id})
     except Exception as e:
-        logging.error(f"Eroare la scriere Firestore: {e}")
-        return jsonify({"error": str(e)}), 500
+        logging.error(f"Eroare la crearea sesiunii: {e}")
+        return jsonify({"error": str(e), "details": "Verificati permisiunile Firestore"}), 500
 
 @app.route('/api/session/join', methods=['POST'])
 def join_session():
-    data = request.json
-    session_id = data.get('session_id')
-    player_name = data.get('name', 'Player')
-    player_id = data.get('player_id') or str(uuid.uuid4())
-    
-    doc_ref = get_session_doc(session_id)
-    doc = doc_ref.get()
-    
-    if not doc.exists:
-        return jsonify({"error": "Sesiunea nu exista"}), 404
-    
-    state = doc.to_dict()
-    if player_id not in state['players']:
-        if len(state['players']) >= 4:
-            return jsonify({"error": "Sesiune plina"}), 400
+    try:
+        data = request.json
+        session_id = data.get('session_id')
+        player_name = data.get('name', 'Player')
+        player_id = data.get('player_id') or str(uuid.uuid4())
         
-        bag = state['bag']
-        rack = [bag.pop() for _ in range(7) if bag]
-        state['players'][player_id] = {
-            "id": player_id,
-            "name": player_name,
-            "score": 0,
-            "rack": rack,
-            "online": True
-        }
-        state['turn_order'].append(player_id)
-        state['bag'] = bag
-        state['chat_history'].append(f"System: {player_name} s-a alaturat.")
+        doc_ref = get_session_doc(session_id)
+        doc = doc_ref.get()
         
-    state['last_update'] = datetime.utcnow().isoformat()
-    doc_ref.set(state)
-    
-    return jsonify({"status": "ok", "player_id": player_id})
+        if not doc.exists:
+            return jsonify({"error": "Sesiunea nu exista"}), 404
+        
+        state = doc.to_dict()
+        if player_id not in state['players']:
+            if len(state['players']) >= 4:
+                return jsonify({"error": "Sesiune plina"}), 400
+            
+            bag = state['bag']
+            rack = [bag.pop() for _ in range(7) if bag]
+            state['players'][player_id] = {
+                "id": player_id,
+                "name": player_name,
+                "score": 0,
+                "rack": rack,
+                "online": True
+            }
+            state['turn_order'].append(player_id)
+            state['bag'] = bag
+            state['chat_history'].append(f"System: {player_name} s-a alaturat.")
+            
+        state['last_update'] = datetime.utcnow().isoformat()
+        doc_ref.set(state)
+        
+        return jsonify({"status": "ok", "player_id": player_id})
+    except Exception as e:
+        logging.error(f"Eroare la alaturare: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({"status": "online", "firebase": "initialized" if firebase_admin._apps else "failed"})
+    return jsonify({
+        "status": "online", 
+        "firebase": "initialized" if firebase_admin._apps else "failed",
+        "app_id": app_id
+    })
 
 if __name__ == '__main__':
     app.run(debug=True)
