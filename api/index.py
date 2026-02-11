@@ -11,39 +11,46 @@ from datetime import datetime
 # Initializare Flask
 app = Flask(__name__)
 
-# Configuratii Firebase - Curatam spatiile albe cu .strip()
-firebase_config_raw = os.environ.get("__firebase_config", "{}").strip()
+# Configuratii Firebase - Curatam spatiile albe si verificam validitatea
+firebase_config_raw = os.environ.get("__firebase_config", "").strip()
 app_id = os.environ.get("__app_id", "scrabble-ro").strip()
 service_account_raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
 
-try:
-    firebase_config = json.loads(firebase_config_raw)
-except Exception as e:
-    logging.error(f"Eroare la parsarea __firebase_config: {e}")
-    firebase_config = {}
+firebase_config = {}
+if firebase_config_raw:
+    try:
+        firebase_config = json.loads(firebase_config_raw)
+    except Exception as e:
+        logging.error(f"Eroare critica la parsarea __firebase_config: {e}. Valoare primita: {firebase_config_raw[:20]}...")
 
 # Initializam Firebase Admin
+db = None
 try:
     if not firebase_admin._apps:
-        if service_account_raw:
-            # Daca avem Service Account, il folosim (metoda sigura)
-            service_account_info = json.loads(service_account_raw)
-            cred = credentials.Certificate(service_account_info)
-            firebase_admin.initialize_app(cred)
-            logging.info("Firebase Admin: Initializat cu Service Account.")
-        else:
-            # Altfel folosim Project ID din config
+        if service_account_raw and service_account_raw.startswith('{'):
+            # Metoda sigura: Service Account
+            try:
+                service_account_info = json.loads(service_account_raw)
+                cred = credentials.Certificate(service_account_info)
+                firebase_admin.initialize_app(cred)
+                logging.info("Firebase Admin: Initializat cu Service Account.")
+            except Exception as e:
+                logging.error(f"Eroare la incarcarea Service Account: {e}")
+        
+        # Daca inca nu e initializat, incercam cu Project ID
+        if not firebase_admin._apps:
             project_id = firebase_config.get("projectId")
             if project_id:
                 firebase_admin.initialize_app(options={'projectId': project_id})
                 logging.info(f"Firebase Admin: Initializat cu Project ID: {project_id}")
             else:
+                # Ultima incercare: cautare implicita a mediului
                 firebase_admin.initialize_app()
+                logging.info("Firebase Admin: Initializat implicit.")
     
     db = firestore.client()
 except Exception as e:
-    logging.error(f"Eroare initializare Firebase: {e}")
-    db = None
+    logging.error(f"Eroare generala initializare Firebase: {e}")
 
 # --- CONSTANTE JOC ---
 LETTER_DISTRIBUTION = {
@@ -87,7 +94,7 @@ def create_initial_state(player_name, player_id):
 @app.route('/api/session/create', methods=['POST'])
 def create_session():
     if not db:
-        return jsonify({"error": "Baza de date neinitializata"}), 500
+        return jsonify({"error": "Baza de date neinitializata. Verificati log-urile serverului pentru detalii de conectare."}), 500
         
     try:
         data = request.json or {}
@@ -99,8 +106,8 @@ def create_session():
         get_session_doc(session_id).set(state)
         return jsonify({"session_id": session_id, "player_id": player_id})
     except Exception as e:
-        logging.error(f"Eroare Create: {e}")
-        return jsonify({"error": str(e)}), 500
+        logging.error(f"Eroare la crearea sesiunii in Firestore: {e}")
+        return jsonify({"error": "Eroare la scrierea in baza de date. Verificati permisiunile Service Account."}), 500
 
 @app.route('/api/session/join', methods=['POST'])
 def join_session():
@@ -147,8 +154,10 @@ def join_session():
 def health():
     return jsonify({
         "status": "online", 
-        "firebase": "initialized" if firebase_admin._apps else "failed",
+        "firebase_initialized": firebase_admin._apps is not None and len(firebase_admin._apps) > 0,
         "db_connected": db is not None,
+        "config_present": len(firebase_config_raw) > 0,
+        "service_account_present": len(service_account_raw) > 0,
         "app_id": app_id
     })
 
