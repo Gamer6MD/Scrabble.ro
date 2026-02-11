@@ -11,34 +11,39 @@ from datetime import datetime
 # Initializare Flask
 app = Flask(__name__)
 
-# Configuratii Firebase
-firebase_config_raw = os.environ.get("__firebase_config", "{}")
-firebase_config = json.loads(firebase_config_raw)
-app_id = os.environ.get("__app_id", "scrabble-ro")
-service_account_raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+# Configuratii Firebase - Curatam spatiile albe cu .strip()
+firebase_config_raw = os.environ.get("__firebase_config", "{}").strip()
+app_id = os.environ.get("__app_id", "scrabble-ro").strip()
+service_account_raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
+
+try:
+    firebase_config = json.loads(firebase_config_raw)
+except Exception as e:
+    logging.error(f"Eroare la parsarea __firebase_config: {e}")
+    firebase_config = {}
 
 # Initializam Firebase Admin
 try:
     if not firebase_admin._apps:
         if service_account_raw:
-            # Metoda recomandata: Folosind Service Account JSON din variabila de mediu
+            # Daca avem Service Account, il folosim (metoda sigura)
             service_account_info = json.loads(service_account_raw)
             cred = credentials.Certificate(service_account_info)
             firebase_admin.initialize_app(cred)
-            logging.info("Firebase initialized with Service Account Key")
+            logging.info("Firebase Admin: Initializat cu Service Account.")
         else:
-            # Fallback la Project ID daca nu avem Service Account (poate da erori 500 la scriere)
+            # Altfel folosim Project ID din config
             project_id = firebase_config.get("projectId")
-            firebase_admin.initialize_app(options={'projectId': project_id})
-            logging.info(f"Firebase initialized with Project ID fallback: {project_id}")
+            if project_id:
+                firebase_admin.initialize_app(options={'projectId': project_id})
+                logging.info(f"Firebase Admin: Initializat cu Project ID: {project_id}")
+            else:
+                firebase_admin.initialize_app()
     
     db = firestore.client()
 except Exception as e:
-    logging.error(f"Eroare critica la initializarea Firebase: {e}")
-    # Ultimul efort de salvare
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app()
-    db = firestore.client()
+    logging.error(f"Eroare initializare Firebase: {e}")
+    db = None
 
 # --- CONSTANTE JOC ---
 LETTER_DISTRIBUTION = {
@@ -50,7 +55,7 @@ LETTER_DISTRIBUTION = {
 }
 
 def get_session_doc(session_id):
-    # Structura corecta a path-ului conform regulilor de securitate si structurii dorite
+    if not db: return None
     return db.collection('artifacts').document(app_id).collection('public').document('data').collection('sessions').document(session_id)
 
 def create_initial_state(player_name, player_id):
@@ -79,10 +84,10 @@ def create_initial_state(player_name, player_id):
         "last_update": datetime.utcnow().isoformat()
     }
 
-@app.route('/api/session/create', methods=['POST', 'GET'])
+@app.route('/api/session/create', methods=['POST'])
 def create_session():
-    if request.method == 'GET':
-        return jsonify({"message": "Foloseste POST pentru a crea o sesiune"}), 405
+    if not db:
+        return jsonify({"error": "Baza de date neinitializata"}), 500
         
     try:
         data = request.json or {}
@@ -94,11 +99,13 @@ def create_session():
         get_session_doc(session_id).set(state)
         return jsonify({"session_id": session_id, "player_id": player_id})
     except Exception as e:
-        logging.error(f"Eroare la crearea sesiunii: {e}")
-        return jsonify({"error": str(e), "details": "Verificati Service Account si Firestore Rules"}), 500
+        logging.error(f"Eroare Create: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/session/join', methods=['POST'])
 def join_session():
+    if not db:
+        return jsonify({"error": "Baza de date neinitializata"}), 500
     try:
         data = request.json
         session_id = data.get('session_id')
@@ -134,7 +141,6 @@ def join_session():
         
         return jsonify({"status": "ok", "player_id": player_id})
     except Exception as e:
-        logging.error(f"Eroare la alaturare: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/health', methods=['GET'])
@@ -142,7 +148,7 @@ def health():
     return jsonify({
         "status": "online", 
         "firebase": "initialized" if firebase_admin._apps else "failed",
-        "using_service_account": service_account_raw is not None,
+        "db_connected": db is not None,
         "app_id": app_id
     })
 
