@@ -29,21 +29,17 @@ try:
     if not firebase_admin._apps:
         if service_account_raw:
             try:
-                # --- LOGICA DE CURATARE AGRESIVA A JSON-ULUI ---
-                clean_json = service_account_raw
-                
-                # 1. Eliminam ghilimelele de la inceput si sfarsit daca Vercel le-a adaugat automat
+                # Curatam orice caracter care ar putea invalida JSON-ul (ghilimele in plus sau escape-uri)
+                clean_json = service_account_raw.strip()
                 if clean_json.startswith('"') and clean_json.endswith('"'):
                     clean_json = clean_json[1:-1]
                 
-                # 2. Inlocuim escape-urile pentru newline (importante pentru private_key)
-                # Uneori Vercel dubleaza backslash-ul \\n
+                # Inlocuim escape-urile pentru newline pentru a fi siguri ca private_key este valida
                 clean_json = clean_json.replace('\\\\n', '\n').replace('\\n', '\n')
                 
-                # 3. Incarcam obiectul
                 cert_dict = json.loads(clean_json)
                 
-                # 4. Asiguram formatul corect pentru private_key
+                # Asiguram procesarea corecta a cheii private
                 if 'private_key' in cert_dict:
                     cert_dict['private_key'] = cert_dict['private_key'].replace('\\n', '\n')
                 
@@ -53,12 +49,12 @@ try:
             except Exception as e:
                 logging.error(f"Eroare critica la parsarea Service Account: {e}")
 
-        # Fallback la Project ID
+        # Fallback la Project ID daca prima metoda esueaza
         if not firebase_admin._apps:
             project_id = firebase_config.get("projectId")
             if project_id:
                 firebase_admin.initialize_app(options={'projectId': project_id})
-                logging.info(f"Firebase Admin: Fallback la Project ID: {project_id}")
+                logging.info(f"Firebase Admin: Initializat via Project ID: {project_id}")
             else:
                 firebase_admin.initialize_app()
     
@@ -77,7 +73,7 @@ LETTER_DISTRIBUTION = {
 
 def get_session_doc(session_id):
     if not db: return None
-    # Structura: artifacts/{app_id}/public/data/sessions/{session_id}
+    # Structura obligatorie pentru persistenta
     return db.collection('artifacts').document(app_id).collection('public').document('data').collection('sessions').document(session_id)
 
 def create_initial_state(player_name, player_id):
@@ -109,7 +105,7 @@ def create_initial_state(player_name, player_id):
 @app.route('/api/session/create', methods=['POST'])
 def create_session():
     if not db:
-        return jsonify({"error": "DB neinitializat. Verificati Service Account."}), 500
+        return jsonify({"error": "Baza de date neinitializata"}), 500
         
     try:
         data = request.json or {}
@@ -121,7 +117,7 @@ def create_session():
         get_session_doc(session_id).set(state)
         return jsonify({"session_id": session_id, "player_id": player_id})
     except Exception as e:
-        logging.error(f"Eroare Firestore Set: {e}")
+        logging.error(f"Eroare Firestore: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/session/join', methods=['POST'])
