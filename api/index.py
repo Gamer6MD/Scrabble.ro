@@ -11,7 +11,7 @@ from datetime import datetime
 # Initializare Flask
 app = Flask(__name__)
 
-# Configuratii Firebase - Curatam spatiile albe si verificam validitatea
+# Configuratii Firebase
 firebase_config_raw = os.environ.get("__firebase_config", "").strip()
 app_id = os.environ.get("__app_id", "scrabble-ro").strip()
 service_account_raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
@@ -27,30 +27,41 @@ if firebase_config_raw:
 db = None
 try:
     if not firebase_admin._apps:
-        # Prioritate 1: Service Account explicit (cel mai sigur pentru scriere)
-        if service_account_raw and (service_account_raw.startswith('{') or service_account_raw.startswith('[')):
+        if service_account_raw:
             try:
-                # Curatare suplimentara pentru caractere ascunse
-                clean_json = service_account_raw.replace('\n', '').replace('\r', '')
-                service_account_info = json.loads(clean_json)
-                cred = credentials.Certificate(service_account_info)
+                # --- LOGICA DE CURATARE AGRESIVA A JSON-ULUI ---
+                clean_json = service_account_raw
+                
+                # 1. Eliminam ghilimelele de la inceput si sfarsit daca Vercel le-a adaugat automat
+                if clean_json.startswith('"') and clean_json.endswith('"'):
+                    clean_json = clean_json[1:-1]
+                
+                # 2. Inlocuim escape-urile pentru newline (importante pentru private_key)
+                # Uneori Vercel dubleaza backslash-ul \\n
+                clean_json = clean_json.replace('\\\\n', '\n').replace('\\n', '\n')
+                
+                # 3. Incarcam obiectul
+                cert_dict = json.loads(clean_json)
+                
+                # 4. Asiguram formatul corect pentru private_key
+                if 'private_key' in cert_dict:
+                    cert_dict['private_key'] = cert_dict['private_key'].replace('\\n', '\n')
+                
+                cred = credentials.Certificate(cert_dict)
                 firebase_admin.initialize_app(cred)
                 logging.info("Firebase Admin: Initializat cu succes via Service Account.")
             except Exception as e:
-                logging.error(f"Eroare la incarcarea Service Account JSON: {e}")
+                logging.error(f"Eroare critica la parsarea Service Account: {e}")
 
-        # Prioritate 2: Daca nu avem Service Account, folosim Project ID (doar pt Read de obicei)
+        # Fallback la Project ID
         if not firebase_admin._apps:
             project_id = firebase_config.get("projectId")
             if project_id:
                 firebase_admin.initialize_app(options={'projectId': project_id})
-                logging.info(f"Firebase Admin: Initializat via Project ID: {project_id}")
+                logging.info(f"Firebase Admin: Fallback la Project ID: {project_id}")
             else:
-                # Fallback final: Application Default Credentials (da eroare pe Vercel de obicei)
                 firebase_admin.initialize_app()
-                logging.info("Firebase Admin: Initializat via implicit (ADC).")
     
-    # Obtinem clientul Firestore
     db = firestore.client()
 except Exception as e:
     logging.error(f"Eroare generala initializare Firebase: {e}")
@@ -66,7 +77,7 @@ LETTER_DISTRIBUTION = {
 
 def get_session_doc(session_id):
     if not db: return None
-    # Structura: /artifacts/scrabble-ro/public/data/sessions/{session_id}
+    # Structura: artifacts/{app_id}/public/data/sessions/{session_id}
     return db.collection('artifacts').document(app_id).collection('public').document('data').collection('sessions').document(session_id)
 
 def create_initial_state(player_name, player_id):
@@ -98,7 +109,7 @@ def create_initial_state(player_name, player_id):
 @app.route('/api/session/create', methods=['POST'])
 def create_session():
     if not db:
-        return jsonify({"error": "Baza de date neinitializata. Verificati configuratia Firebase."}), 500
+        return jsonify({"error": "DB neinitializat. Verificati Service Account."}), 500
         
     try:
         data = request.json or {}
@@ -110,8 +121,8 @@ def create_session():
         get_session_doc(session_id).set(state)
         return jsonify({"session_id": session_id, "player_id": player_id})
     except Exception as e:
-        logging.error(f"Eroare la scrierea in Firestore: {e}")
-        return jsonify({"error": f"Eroare la scrierea in baza de date: {str(e)}"}), 500
+        logging.error(f"Eroare Firestore Set: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/session/join', methods=['POST'])
 def join_session():
@@ -158,9 +169,8 @@ def join_session():
 def health():
     return jsonify({
         "status": "online", 
-        "firebase_initialized": firebase_admin._apps is not None and len(firebase_admin._apps) > 0,
+        "firebase_ready": len(firebase_admin._apps) > 0,
         "db_connected": db is not None,
-        "config_present": len(firebase_config_raw) > 0,
         "service_account_present": len(service_account_raw) > 0,
         "app_id": app_id
     })
