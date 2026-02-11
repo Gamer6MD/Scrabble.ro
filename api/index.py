@@ -108,8 +108,14 @@ def create_initial_state(player_name, player_id):
     random.shuffle(bag)
     player_rack = [bag.pop() for _ in range(7) if bag]
     
+    # Convertim board-ul într-un format compatibil cu Firestore (map în loc de arrays imbricate)
+    board_map = {}
+    for i in range(15):
+        for j in range(15):
+            board_map[f"{i}_{j}"] = None
+    
     return {
-        "board": [[None for _ in range(15)] for _ in range(15)],
+        "board": board_map,  # Format: {"0_0": null, "0_1": null, ...}
         "bag": bag,
         "players": {
             player_id: {
