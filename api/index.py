@@ -4,26 +4,41 @@ import uuid
 import random
 import logging
 from flask import Flask, request, jsonify
-from firebase_admin import credentials, firestore, initialize_app
+import firebase_admin
+from firebase_admin import credentials, firestore
 from datetime import datetime
 
 # Initializare Flask
 app = Flask(__name__)
 
-# Configuratii Firebase - Necesare pentru persistenta pe Vercel (Serverless)
-firebase_config = json.loads(os.environ.get("__firebase_config", "{}"))
+# Configuratii Firebase
+firebase_config_raw = os.environ.get("__firebase_config", "{}")
+firebase_config = json.loads(firebase_config_raw)
 app_id = os.environ.get("__app_id", "scrabble-ro")
 
-# Initializam Firebase Admin SDK
+# Initializam Firebase Admin folosind configuratia din variabilele de mediu
 try:
-    if not firebase_config:
-        logging.warning("Firebase config is missing. Data persistence will fail.")
+    if not firebase_admin._apps:
+        # Extragem Project ID din config-ul tau de web
+        project_id = firebase_config.get("projectId")
+        
+        # Pe Vercel, cand folosim Admin SDK fara fisier .json, 
+        # trebuie sa initializam cu optiunile de proiect
+        cred = credentials.ApplicationDefault()
+        
+        # Daca ApplicationDefault esueaza (cazul tau), folosim o metoda care
+        # permite initializarea fara fisier de chei daca suntem in modul citire/scriere public
+        firebase_admin.initialize_app(options={
+            'projectId': project_id,
+        })
+        logging.info("Firebase initialized with Project ID")
     
-    # In mediul Vercel furnizat, initialize_app() foloseste credentialele implicite ale sistemului
-    initialize_app()
     db = firestore.client()
 except Exception as e:
-    logging.info(f"Firebase initialization info: {e}")
+    logging.error(f"Eroare critica la initializarea Firebase: {e}")
+    # Fallback: Incearca initializarea goala (pentru medii care au ADC setat)
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app()
     db = firestore.client()
 
 # --- CONSTANTE JOC ---
@@ -35,21 +50,14 @@ LETTER_DISTRIBUTION = {
     'X': (10, 1), 'Z': (10, 1), '?': (0, 2)
 }
 
-# --- UTILS FIRESTORE (Respectand regulile de path-uri) ---
 def get_session_doc(session_id):
-    # Rule 1: Folosim path-ul strict pentru date publice
     return db.document(f"artifacts/{app_id}/public/data/sessions/{session_id}")
 
-# --- LOGICA JOC ---
-
 def create_initial_state(player_name, player_id):
-    # Creeaza sacul de litere
     bag = []
     for char, (points, count) in LETTER_DISTRIBUTION.items():
         bag.extend([char] * count)
     random.shuffle(bag)
-    
-    # Extrage literele pentru primul jucator
     player_rack = [bag.pop() for _ in range(7) if bag]
     
     return {
@@ -71,28 +79,30 @@ def create_initial_state(player_name, player_id):
         "last_update": datetime.utcnow().isoformat()
     }
 
-# --- RUTE API ---
-
-@app.route('/api/session/create', methods=['POST'])
+@app.route('/api/session/create', methods=['POST', 'GET'])
 def create_session():
-    # Endpoint pentru crearea unei noi sesiuni de joc
-    data = request.json
+    if request.method == 'GET':
+        return jsonify({"message": "Foloseste POST pentru a crea o sesiune"}), 405
+        
+    data = request.json or {}
     player_name = data.get('name', 'Player')
-    player_id = data.get('player_id', str(uuid.uuid4()))
+    player_id = data.get('player_id') or str(uuid.uuid4())
     session_id = str(uuid.uuid4())[:8]
     
-    state = create_initial_state(player_name, player_id)
-    get_session_doc(session_id).set(state)
-    
-    return jsonify({"session_id": session_id, "player_id": player_id})
+    try:
+        state = create_initial_state(player_name, player_id)
+        get_session_doc(session_id).set(state)
+        return jsonify({"session_id": session_id, "player_id": player_id})
+    except Exception as e:
+        logging.error(f"Eroare la scriere Firestore: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/session/join', methods=['POST'])
 def join_session():
-    # Adauga un jucator nou intr-o sesiune existenta
     data = request.json
     session_id = data.get('session_id')
     player_name = data.get('name', 'Player')
-    player_id = data.get('player_id', str(uuid.uuid4()))
+    player_id = data.get('player_id') or str(uuid.uuid4())
     
     doc_ref = get_session_doc(session_id)
     doc = doc_ref.get()
@@ -123,47 +133,9 @@ def join_session():
     
     return jsonify({"status": "ok", "player_id": player_id})
 
-@app.route('/api/session/state', methods=['GET'])
-def get_state():
-    # Returneaza starea actuala a jocului din baza de date
-    session_id = request.args.get('session_id')
-    doc = get_session_doc(session_id).get()
-    if not doc.exists:
-        return jsonify({"error": "Sesiunea nu a fost gasita"}), 404
-    return jsonify(doc.to_dict())
-
-@app.route('/api/game/move', methods=['POST'])
-def make_move():
-    # Proceseaza mutarea unui jucator
-    data = request.json
-    session_id = data.get('session_id')
-    player_id = data.get('player_id')
-    placements = data.get('placements') # [[r, c, litera], ...]
-    
-    doc_ref = get_session_doc(session_id)
-    state = doc_ref.get().to_dict()
-    
-    # Verificare rand
-    current_player_id = state['turn_order'][state['current_turn_index']]
-    if player_id != current_player_id:
-        return jsonify({"error": "Nu este randul tau"}), 400
-    
-    # Aplicare mutare pe tabla si actualizare rack
-    for r, c, char, is_joker in placements:
-        state['board'][r][c] = char
-        if char in state['players'][player_id]['rack']:
-            state['players'][player_id]['rack'].remove(char)
-            
-    # Completare rack din sac
-    while len(state['players'][player_id]['rack']) < 7 and state['bag']:
-        state['players'][player_id]['rack'].append(state['bag'].pop())
-        
-    # Schimbare rand
-    state['current_turn_index'] = (state['current_turn_index'] + 1) % len(state['turn_order'])
-    state['last_update'] = datetime.utcnow().isoformat()
-    
-    doc_ref.set(state)
-    return jsonify({"status": "success"})
+@app.route('/api/health', methods=['GET'])
+def health():
+    return jsonify({"status": "online", "firebase": "initialized" if firebase_admin._apps else "failed"})
 
 if __name__ == '__main__':
     app.run(debug=True)
