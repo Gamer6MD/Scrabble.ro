@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scrabble RO - Vercel Edition</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <script type="module">
+        // Importam modulele necesare din Firebase SDK 12.9.0
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-app.js";
+        import { getFirestore, doc, onSnapshot } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-firestore.js";
+        import { getAnalytics } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-analytics.js";
+
+        // Configurația ta Firebase furnizată
+        const firebaseConfig = {
+            apiKey: "AIzaSyAlDknyr0Iq7o3AQfvbmdVGSfqbmXcpu84",
+            authDomain: "scrabble-ro.firebaseapp.com",
+            projectId: "scrabble-ro",
+            storageBucket: "scrabble-ro.firebasestorage.app",
+            messagingSenderId: "233579107851",
+            appId: "1:233579107851:web:96913ea9bec49c8183990e",
+            measurementId: "G-LHZ0KWETMV"
+        };
+
+        // Initializare Firebase
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const analytics = getAnalytics(app);
+        
+        // ID-ul aplicatiei definit in backend
+        const appId = 'scrabble-ro';
+
+        // State-ul local
+        let sessionId = "";
+        let playerId = localStorage.getItem('scrabble_player_id') || null;
+        let gameState = null;
+
+        // --- FUNCTII API CATRE VERCEL ---
+
+        async function apiRequest(endpoint, method = 'POST', body = null) {
+            try {
+                const response = await fetch(`/api/${endpoint}`, {
+                    method: method,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: body ? JSON.stringify(body) : null
+                });
+                return await response.json();
+            } catch (err) {
+                console.error("Eroare API:", err);
+                return { error: "Nu s-a putut contacta serverul." };
+            }
+        }
+
+        // Functii globale pentru butoanele din UI
+        window.createGame = async () => {
+            const name = document.getElementById('player-name').value || 'Jucător 1';
+            const data = await apiRequest('session/create', 'POST', { name, player_id: playerId });
+            if (data.session_id) {
+                sessionId = data.session_id;
+                playerId = data.player_id;
+                localStorage.setItem('scrabble_player_id', playerId);
+                startListening(sessionId);
+            }
+        };
+
+        window.joinGame = async () => {
+            const name = document.getElementById('player-name').value || 'Jucător 2';
+            const sId = document.getElementById('session-id-input').value.trim();
+            if (!sId) return alert("Introdu codul sesiunii!");
+            
+            const data = await apiRequest('session/join', 'POST', { 
+                session_id: sId, 
+                name, 
+                player_id: playerId 
+            });
+            
+            if (data.error) return alert(data.error);
+            
+            sessionId = sId;
+            playerId = data.player_id;
+            localStorage.setItem('scrabble_player_id', playerId);
+            startListening(sessionId);
+        };
+
+        // --- SINCRONIZARE REAL-TIME ---
+
+        function startListening(sId) {
+            document.getElementById('lobby').classList.add('hidden');
+            document.getElementById('game-area').classList.remove('hidden');
+            document.getElementById('display-session-id').textContent = sId;
+
+            // Ascultam schimbarile din Firestore (Rule 1: artifacts/{appId}/public/data/...)
+            const sessionPath = `artifacts/${appId}/public/data/sessions/${sId}`;
+            onSnapshot(doc(db, sessionPath), (docSnap) => {
+                if (docSnap.exists()) {
+                    gameState = docSnap.data();
+                    renderGame();
+                } else {
+                    console.warn("Sesiunea nu mai exista.");
+                }
+            }, (error) => {
+                console.error("Eroare Firestore:", error);
+            });
+        }
+
+        function renderGame() {
+            if (!gameState) return;
+            
+            // Randare scoruri
+            const playersEl = document.getElementById('players-list');
+            playersEl.innerHTML = Object.values(gameState.players)
+                .map(p => {
+                    const isCurrentTurn = p.id === gameState.turn_order[gameState.current_turn_index];
+                    return `<div class="p-2 border rounded ${isCurrentTurn ? 'bg-blue-100 border-blue-500 font-bold' : 'bg-white'}">
+                        ${p.name}: ${p.score} pct
+                    </div>`;
+                }).join('');
+
+            // Randare tabla (Simplificata)
+            const boardEl = document.getElementById('board');
+            boardEl.innerHTML = '';
+            gameState.board.forEach((row, rIdx) => {
+                row.forEach((cell, cIdx) => {
+                    const cellDiv = document.createElement('div');
+                    cellDiv.className = "w-full h-full border border-gray-400 flex items-center justify-center bg-white text-xs sm:text-sm font-bold aspect-square";
+                    cellDiv.textContent = cell || '';
+                    if (cell) cellDiv.classList.add('bg-yellow-100');
+                    boardEl.appendChild(cellDiv);
+                });
+            });
+        }
+    </script>
+    <style>
+        #board { 
+            display: grid; 
+            grid-template-columns: repeat(15, 1fr); 
+            width: 100%; 
+            max-width: 600px; 
+            margin: 0 auto;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 min-h-screen p-4 sm:p-8 font-sans">
+
+    <!-- LOBBY -->
+    <div id="lobby" class="max-w-md mx-auto bg-white p-6 rounded-2xl shadow-xl">
+        <h1 class="text-3xl font-extrabold text-slate-800 mb-6 text-center">Scrabble RO</h1>
+        <div class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium text-slate-700 mb-1">Numele tău</label>
+                <input id="player-name" type="text" placeholder="Ex: Andrei" class="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none">
+            </div>
+            <button onclick="createGame()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition shadow-lg">Creează Joc Nou</button>
+            
+            <div class="relative py-4">
+                <div class="absolute inset-0 flex items-center"><div class="w-full border-t border-slate-200"></div></div>
+                <div class="relative flex justify-center text-sm"><span class="bg-white px-2 text-slate-500">SAU</span></div>
+            </div>
+
+            <div class="flex gap-2">
+                <input id="session-id-input" type="text" placeholder="Cod Sesiune" class="flex-1 p-3 border border-slate-300 rounded-lg outline-none">
+                <button onclick="joinGame()" class="bg-emerald-500 hover:bg-emerald-600 text-white font-bold px-6 rounded-lg transition shadow-lg">Alătură-te</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- GAME AREA -->
+    <div id="game-area" class="hidden max-w-6xl mx-auto animate-fadeIn">
+        <header class="flex flex-col sm:flex-row justify-between items-center mb-6 gap-4">
+            <h2 class="text-2xl font-bold text-slate-800">Cameră: <span id="display-session-id" class="text-blue-600 tracking-widest"></span></h2>
+            <div id="players-list" class="flex flex-wrap gap-2"></div>
+        </header>
+        
+        <main class="grid lg:grid-cols-3 gap-8">
+            <div class="lg:col-span-2">
+                <div id="board" class="bg-slate-300 p-1 rounded shadow-2xl border-4 border-slate-800"></div>
+            </div>
+            
+            <aside class="space-y-6">
+                <div class="bg-white p-5 rounded-2xl shadow-md border border-slate-200">
+                    <h3 class="font-bold text-lg mb-3 text-slate-800 border-b pb-2">Acțiuni</h3>
+                    <div id="controls" class="space-y-3">
+                        <p class="text-sm text-slate-500 italic">Aici vor apărea butoanele de validare, pas sau schimbare litere.</p>
+                        <!-- Logica de plasare litere va popula acest spatiu -->
+                    </div>
+                </div>
+            </aside>
+        </main>
+    </div>
+
+</body>
+</html>
