@@ -34,9 +34,8 @@ def clean_service_account_json(raw_json):
     
     # PROBLEMA: Vercel trimite newline-uri reale în JSON, ceea ce invalidează JSON-ul
     # SOLUTIE: Transformăm newline-urile reale în secvențe escape \n
-    # Mai întâi, eliminăm orice newline real din afara string-urilor
     cleaned = re.sub(r'(?<!\\)\n', r'\\n', cleaned)
-    cleaned = cleaned.replace('\\\\n', '\\n')  # Corectează double-escaping
+    cleaned = cleaned.replace('\\\\n', '\\n')
     
     # Elimină alte caractere de control problematice
     cleaned = re.sub(r'[\x00-\x09\x0B-\x0C\x0E-\x1F\x7F]', '', cleaned)
@@ -47,48 +46,81 @@ def clean_service_account_json(raw_json):
 db = None
 try:
     if not firebase_admin._apps:
-        # Prioritate maxima: Initializare prin Service Account JSON string
         if service_account_raw:
             try:
                 clean_json = clean_service_account_json(service_account_raw)
-                logging.info(f"JSON curatat (primele 100 caractere): {clean_json[:100]}...")
-                
                 cert_dict = json.loads(clean_json)
-                logging.info(f"Service Account parsat cu succes pentru proiectul: {cert_dict.get('project_id')}")
                 
-                # Validam existenta campurilor critice
                 if all(k in cert_dict for k in ['project_id', 'private_key', 'client_email']):
                     cred = credentials.Certificate(cert_dict)
                     firebase_admin.initialize_app(cred)
-                    logging.info(f"Firebase Admin: Initializat cu succes via Service Account pentru proiectul: {cert_dict.get('project_id')}")
+                    logging.info(f"Firebase Admin: Initializat cu succes pentru proiectul: {cert_dict.get('project_id')}")
                 else:
-                    logging.error("Service Account JSON incomplet (lipsesc campuri cheie)." +
-                                 f" Campuri prezente: {list(cert_dict.keys())}")
-            except json.JSONDecodeError as e:
-                logging.error(f"Eroare JSONDecodeError la parsarea Service Account: {e} la pozitia {e.pos}")
-                # Încearcă să găsim și să eliminăm caracterul problematic
-                if e.pos < len(service_account_raw):
-                    logging.error(f"Caracterul problematic: '{service_account_raw[e.pos-5:e.pos+5]}'")
+                    logging.error("Service Account JSON incomplet.")
             except Exception as e:
                 logging.error(f"Eroare la procesarea Service Account JSON: {e}")
 
-        # Fallback 1: Project ID din configuratie
         if not firebase_admin._apps and firebase_config.get("projectId"):
             firebase_admin.initialize_app(options={'projectId': firebase_config.get("projectId")})
-            logging.info("Firebase Admin: Initializat via Project ID (Limited Access).")
+            logging.info("Firebase Admin: Initializat via Project ID.")
             
-        # Fallback 2: Default (va cauta Application Default Credentials)
         if not firebase_admin._apps:
             firebase_admin.initialize_app()
             logging.info("Firebase Admin: Initializat implicit.")
     
-    # Obtinem clientul Firestore
     db = firestore.client()
 except Exception as e:
     logging.error(f"Eroare generala initializare Firebase: {e}")
 
+# --- DICȚIONARE ---
+AVAILABLE_DICTIONARIES = {
+    "loc-flexiuni-5.0.txt": {
+        "name": "LOC Flexiuni 5.0",
+        "description": "Dicționar standard românesc (~679,000 cuvinte)",
+        "file": "loc-flexiuni-5.0.txt"
+    },
+    "loc-flexiuni-6.0.txt": {
+        "name": "LOC Flexiuni 6.0",
+        "description": "Dicționar extins românesc (~706,000 cuvinte)",
+        "file": "loc-flexiuni-6.0.txt"
+    }
+}
+
+# Cache pentru dicționare încărcate
+dictionary_cache = {}
+
+def load_dictionary(filename):
+    """Încarcă dicționarul în memorie (o singură dată)."""
+    if filename in dictionary_cache:
+        return dictionary_cache[filename]
+    
+    try:
+        dict_path = os.path.join(os.path.dirname(__file__), filename)
+        if os.path.exists(dict_path):
+            with open(dict_path, 'r', encoding='utf-8') as f:
+                words = set()
+                for line in f:
+                    word = line.strip().lower()
+                    if word:
+                        words.add(word)
+                dictionary_cache[filename] = words
+                logging.info(f"Dicționar '{filename}' încărcat: {len(words)} cuvinte")
+                return words
+        else:
+            logging.warning(f"Fișierul dicționar '{filename}' nu a fost găsit.")
+            return set()
+    except Exception as e:
+        logging.error(f"Eroare la încărcarea dicționarului '{filename}': {e}")
+        return set()
+
+def validate_word(word, dictionary_file):
+    """Verifică dacă un cuvânt există în dicționar."""
+    word = word.strip().lower()
+    words_set = load_dictionary(dictionary_file)
+    return word in words_set
+
 # --- CONSTANTE JOC ---
-LETTER_DISTRIBUTION = {
+DEFAULT_LETTER_DISTRIBUTION = {
     'A': (1, 11), 'B': (9, 2), 'C': (1, 5), 'D': (2, 4), 'E': (1, 9), 
     'F': (8, 2), 'G': (9, 2), 'H': (10, 1), 'I': (1, 10), 'J': (10, 1), 
     'L': (1, 4), 'M': (4, 3), 'N': (1, 6), 'O': (1, 5), 'P': (2, 4), 
@@ -98,24 +130,41 @@ LETTER_DISTRIBUTION = {
 
 def get_session_doc(session_id):
     if not db: return None
-    # Structura path conform permisiunilor artifacts
     return db.collection('artifacts').document(app_id).collection('public').document('data').collection('sessions').document(session_id)
 
-def create_initial_state(player_name, player_id):
-    bag = []
-    for char, (points, count) in LETTER_DISTRIBUTION.items():
-        bag.extend([char] * count)
-    random.shuffle(bag)
-    player_rack = [bag.pop() for _ in range(7) if bag]
+def create_initial_state(player_name, player_id, settings=None):
+    """Creează starea inițială a jocului cu setările specificate."""
     
-    # Convertim board-ul într-un format compatibil cu Firestore (map în loc de arrays imbricate)
+    # Setări implicite
+    max_players = settings.get('max_players', 4) if settings else 4
+    rack_size = settings.get('rack_size', 7) if settings else 7
+    bag_size = settings.get('bag_size', 100) if settings else 100
+    dictionary = settings.get('dictionary', 'loc-flexiuni-5.0.txt') if settings else 'loc-flexiuni-5.0.txt'
+    
+    # Creează punga cu literele distribuite corect
+    bag = []
+    total_letters = 0
+    for char, (points, count) in DEFAULT_LETTER_DISTRIBUTION.items():
+        if total_letters + count <= bag_size:
+            bag.extend([char] * count)
+            total_letters += count
+        else:
+            remaining = bag_size - total_letters
+            if remaining > 0:
+                bag.extend([char] * remaining)
+            break
+    
+    random.shuffle(bag)
+    player_rack = [bag.pop() for _ in range(min(rack_size, len(bag))) if bag]
+    
+    # Convertim board-ul într-un format compatibil cu Firestore
     board_map = {}
     for i in range(15):
         for j in range(15):
             board_map[f"{i}_{j}"] = None
     
     return {
-        "board": board_map,  # Format: {"0_0": null, "0_1": null, ...}
+        "board": board_map,
         "bag": bag,
         "players": {
             player_id: {
@@ -123,15 +172,48 @@ def create_initial_state(player_name, player_id):
                 "name": player_name,
                 "score": 0,
                 "rack": player_rack,
-                "online": True
+                "online": True,
+                "is_host": True
             }
         },
         "turn_order": [player_id],
         "current_turn_index": 0,
         "game_started": False,
+        "game_settings": {
+            "max_players": max_players,
+            "rack_size": rack_size,
+            "bag_size": bag_size,
+            "dictionary": dictionary
+        },
         "chat_history": [f"System: {player_name} a creat sesiunea."],
         "last_update": datetime.utcnow().isoformat()
     }
+
+# --- API ENDPOINTS ---
+
+@app.route('/api/dictionaries', methods=['GET'])
+def get_dictionaries():
+    """Returnează lista dicționarelor disponibile."""
+    return jsonify({
+        "dictionaries": AVAILABLE_DICTIONARIES,
+        "loaded_count": {k: len(v) for k, v in dictionary_cache.items()}
+    })
+
+@app.route('/api/dictionary/check', methods=['POST'])
+def check_word():
+    """Verifică dacă un cuvânt există în dicționar."""
+    try:
+        data = request.json or {}
+        word = data.get('word', '').strip()
+        dictionary = data.get('dictionary', 'loc-flexiuni-5.0.txt')
+        
+        if not word:
+            return jsonify({"valid": False, "error": "Cuvântul este gol"})
+        
+        is_valid = validate_word(word, dictionary)
+        return jsonify({"word": word.lower(), "valid": is_valid, "dictionary": dictionary})
+    except Exception as e:
+        return jsonify({"valid": False, "error": str(e)}), 400
 
 @app.route('/api/session/create', methods=['POST'])
 def create_session():
@@ -144,9 +226,22 @@ def create_session():
         player_id = data.get('player_id') or str(uuid.uuid4())
         session_id = str(uuid.uuid4())[:8]
         
-        state = create_initial_state(player_name, player_id)
+        # Setările sesiunii (cu valori implicite)
+        settings = {
+            'max_players': data.get('max_players', 4),
+            'rack_size': data.get('rack_size', 7),
+            'bag_size': data.get('bag_size', 100),
+            'dictionary': data.get('dictionary', 'loc-flexiuni-5.0.txt')
+        }
+        
+        state = create_initial_state(player_name, player_id, settings)
         get_session_doc(session_id).set(state)
-        return jsonify({"session_id": session_id, "player_id": player_id})
+        
+        return jsonify({
+            "session_id": session_id, 
+            "player_id": player_id,
+            "settings": settings
+        })
     except Exception as e:
         logging.error(f"Eroare Firestore la crearea sesiunii: {e}")
         return jsonify({"error": f"Eroare Firestore: {str(e)}"}), 500
@@ -168,18 +263,23 @@ def join_session():
             return jsonify({"error": "Sesiunea nu exista"}), 404
         
         state = doc.to_dict()
+        settings = state.get('game_settings', {})
+        max_players = settings.get('max_players', 4)
+        rack_size = settings.get('rack_size', 7)
+        
         if player_id not in state['players']:
-            if len(state['players']) >= 4:
-                return jsonify({"error": "Sesiune plina"}), 400
+            if len(state['players']) >= max_players:
+                return jsonify({"error": f"Sesiune plina (max {max_players} jucători)"}), 400
             
             bag = state['bag']
-            rack = [bag.pop() for _ in range(7) if bag]
+            rack = [bag.pop() for _ in range(min(rack_size, len(bag))) if bag]
             state['players'][player_id] = {
                 "id": player_id,
                 "name": player_name,
                 "score": 0,
                 "rack": rack,
-                "online": True
+                "online": True,
+                "is_host": False
             }
             state['turn_order'].append(player_id)
             state['bag'] = bag
@@ -188,7 +288,11 @@ def join_session():
         state['last_update'] = datetime.utcnow().isoformat()
         doc_ref.set(state)
         
-        return jsonify({"status": "ok", "player_id": player_id})
+        return jsonify({
+            "status": "ok", 
+            "player_id": player_id,
+            "settings": settings
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -199,7 +303,8 @@ def health():
         "firebase_ready": len(firebase_admin._apps) > 0,
         "db_connected": db is not None,
         "service_account_present": len(service_account_raw) > 0,
-        "app_id": app_id
+        "app_id": app_id,
+        "dictionaries_loaded": list(dictionary_cache.keys())
     })
 
 if __name__ == '__main__':

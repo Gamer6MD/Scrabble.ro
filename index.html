@@ -35,6 +35,8 @@
         let sessionId = "";
         let playerId = localStorage.getItem('scrabble_player_id') || null;
         let gameState = null;
+        let availableDictionaries = {};
+        let isHost = false;
 
         // --- FUNCTII API CATRE VERCEL ---
 
@@ -52,15 +54,61 @@
             }
         }
 
-        // Functii globale pentru butoanele din UI
+        // Încarcă dicționarele disponibile
+        async function loadDictionaries() {
+            const data = await apiRequest('dictionaries', 'GET');
+            if (data.dictionaries) {
+                availableDictionaries = data.dictionaries;
+                populateDictionarySelect();
+            }
+        }
+
+        // Populează select-ul cu dicționare
+        function populateDictionarySelect() {
+            const select = document.getElementById('dictionary-select');
+            select.innerHTML = '';
+            for (const [key, dict] of Object.entries(availableDictionaries)) {
+                const option = document.createElement('option');
+                option.value = key;
+                option.textContent = `${dict.name} (${dict.description})`;
+                select.appendChild(option);
+            }
+        }
+
+        // Funcții globale pentru butoanele din UI
+
+        // Afișează/ascunde setările
+        window.toggleSettings = () => {
+            const settingsPanel = document.getElementById('settings-panel');
+            settingsPanel.classList.toggle('hidden');
+        };
+
+        // Creează joc cu setările selectate
         window.createGame = async () => {
             const name = document.getElementById('player-name').value || 'Jucător 1';
-            const data = await apiRequest('session/create', 'POST', { name, player_id: playerId });
+            
+            // Obține setările
+            const settings = {
+                max_players: parseInt(document.getElementById('max-players').value) || 4,
+                rack_size: parseInt(document.getElementById('rack-size').value) || 7,
+                bag_size: parseInt(document.getElementById('bag-size').value) || 100,
+                dictionary: document.getElementById('dictionary-select').value || 'loc-flexiuni-5.0.txt'
+            };
+            
+            const data = await apiRequest('session/create', 'POST', { 
+                name, 
+                player_id: playerId,
+                ...settings
+            });
+            
             if (data.session_id) {
                 sessionId = data.session_id;
                 playerId = data.player_id;
+                isHost = true;
                 localStorage.setItem('scrabble_player_id', playerId);
                 startListening(sessionId);
+            } else if (data.error) {
+                alert(data.error);
             }
         };
 
@@ -90,7 +138,7 @@
             document.getElementById('game-area').classList.remove('hidden');
             document.getElementById('display-session-id').textContent = sId;
 
-            // Ascultam schimbarile din Firestore (Rule 1: artifacts/{appId}/public/data/...)
+            // Ascultam schimbarile din Firestore
             const sessionPath = `artifacts/${appId}/public/data/sessions/${sId}`;
             onSnapshot(doc(db, sessionPath), (docSnap) => {
                 if (docSnap.exists()) {
@@ -117,29 +165,58 @@
                 boardMatrix.push(row);
             }
             
+            // Afișează setările curente ale jocului
+            const settings = gameState.game_settings || {};
+            document.getElementById('current-settings').innerHTML = `
+                <div class="text-xs text-slate-500 space-y-1">
+                    <p>📚 Dicționar: ${availableDictionaries[settings.dictionary]?.name || settings.dictionary}</p>
+                    <p>👥 Max jucători: ${settings.max_players}</p>
+                    <p>🔤 Litere în mână: ${settings.rack_size}</p>
+                    <p>📦 Litere total: ${settings.bag_size}</p>
+                </div>
+            `;
+            
             // Randare scoruri
             const playersEl = document.getElementById('players-list');
             playersEl.innerHTML = Object.values(gameState.players)
                 .map(p => {
                     const isCurrentTurn = p.id === gameState.turn_order[gameState.current_turn_index];
+                    const isHostBadge = p.is_host ? ' <span class="text-xs bg-yellow-200 px-1 rounded">HOST</span>' : '';
                     return `<div class="p-2 border rounded ${isCurrentTurn ? 'bg-blue-100 border-blue-500 font-bold' : 'bg-white'}">
-                        ${p.name}: ${p.score} pct
+                        ${p.name}${isHostBadge}: ${p.score} pct
                     </div>`;
                 }).join('');
 
-            // Randare tabla (Simplificata)
+            // Randare tabla
             const boardEl = document.getElementById('board');
             boardEl.innerHTML = '';
             boardMatrix.forEach((row, rIdx) => {
                 row.forEach((cell, cIdx) => {
                     const cellDiv = document.createElement('div');
-                    cellDiv.className = "w-full h-full border border-gray-400 flex items-center justify-center bg-white text-xs sm:text-sm font-bold aspect-square";
+                    cellDiv.className = "w-full h-full border border-gray-400 flex items-center justify-center bg-white text-xs sm:text-sm font-bold aspect-square cursor-pointer hover:bg-gray-100";
                     cellDiv.textContent = cell || '';
                     if (cell) cellDiv.classList.add('bg-yellow-100');
+                    // Adaugă coordonatele ca data attributes
+                    cellDiv.dataset.row = rIdx;
+                    cellDiv.dataset.col = cIdx;
                     boardEl.appendChild(cellDiv);
                 });
             });
+            
+            // Randare rack playerului curent
+            const currentPlayer = gameState.players[playerId];
+            if (currentPlayer && currentPlayer.rack) {
+                const rackEl = document.getElementById('player-rack');
+                if (rackEl) {
+                    rackEl.innerHTML = currentPlayer.rack.map(letter => 
+                        `<div class="w-8 h-8 border-2 border-slate-400 rounded bg-white flex items-center justify-center font-bold text-lg cursor-pointer hover:bg-slate-100" data-letter="${letter}">${letter}</div>`
+                    ).join('');
+                }
+            }
         }
+
+        // Încarcă dicționarele la pornire
+        loadDictionaries();
     </script>
     <style>
         #board { 
@@ -161,6 +238,40 @@
                 <label class="block text-sm font-medium text-slate-700 mb-1">Numele tău</label>
                 <input id="player-name" type="text" placeholder="Ex: Andrei" class="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none">
             </div>
+            
+            <!-- Buton Setări -->
+            <button onclick="toggleSettings()" class="w-full bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2 rounded-lg transition text-sm">
+                ⚙️ Setări Joc
+            </button>
+            
+            <!-- Panoul Setări (ascuns implicit) -->
+            <div id="settings-panel" class="hidden bg-slate-50 p-4 rounded-lg border border-slate-200 space-y-3">
+                <h3 class="font-bold text-slate-700 text-sm">Configurare Joc</h3>
+                
+                <div>
+                    <label class="block text-xs font-medium text-slate-600 mb-1">Număr maxim jucători</label>
+                    <input id="max-players" type="number" min="2" max="10" value="4" class="w-full p-2 border border-slate-300 rounded text-sm">
+                </div>
+                
+                <div>
+                    <label class="block text-xs font-medium text-slate-600 mb-1">Litere în mână</label>
+                    <input id="rack-size" type="number" min="5" max="15" value="7" class="w-full p-2 border border-slate-300 rounded text-sm">
+                </div>
+                
+                <div>
+                    <label class="block text-xs font-medium text-slate-600 mb-1">Total litere în pungă</label>
+                    <input id="bag-size" type="number" min="50" max="200" value="100" class="w-full p-2 border border-slate-300 rounded text-sm">
+                </div>
+                
+                <div>
+                    <label class="block text-xs font-medium text-slate-600 mb-1">Dicționar</label>
+                    <select id="dictionary-select" class="w-full p-2 border border-slate-300 rounded text-sm">
+                        <option value="loc-flexiuni-5.0.txt">LOC Flexiuni 5.0 (~679k cuvinte)</option>
+                        <option value="loc-flexiuni-6.0.txt">LOC Flexiuni 6.0 (~706k cuvinte)</option>
+                    </select>
+                </div>
+            </div>
+            
             <button onclick="createGame()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition shadow-lg">Creează Joc Nou</button>
             
             <div class="relative py-4">
@@ -178,7 +289,10 @@
     <!-- GAME AREA -->
     <div id="game-area" class="hidden max-w-6xl mx-auto animate-fadeIn">
         <header class="flex flex-col sm:flex-row justify-between items-center mb-6 gap-4">
-            <h2 class="text-2xl font-bold text-slate-800">Cameră: <span id="display-session-id" class="text-blue-600 tracking-widest"></span></h2>
+            <div>
+                <h2 class="text-2xl font-bold text-slate-800">Cameră: <span id="display-session-id" class="text-blue-600 tracking-widest"></span></h2>
+                <div id="current-settings" class="mt-1"></div>
+            </div>
             <div id="players-list" class="flex flex-wrap gap-2"></div>
         </header>
         
@@ -188,11 +302,16 @@
             </div>
             
             <aside class="space-y-6">
+                <!-- Rack-ul jucătorului -->
+                <div class="bg-white p-5 rounded-2xl shadow-md border border-slate-200">
+                    <h3 class="font-bold text-lg mb-3 text-slate-800 border-b pb-2">Literele Tale</h3>
+                    <div id="player-rack" class="flex flex-wrap gap-1 justify-center"></div>
+                </div>
+                
                 <div class="bg-white p-5 rounded-2xl shadow-md border border-slate-200">
                     <h3 class="font-bold text-lg mb-3 text-slate-800 border-b pb-2">Acțiuni</h3>
                     <div id="controls" class="space-y-3">
-                        <p class="text-sm text-slate-500 italic">Aici vor apărea butoanele de validare, pas sau schimbare litere.</p>
-                        <!-- Logica de plasare litere va popula acest spatiu -->
+                        <p class="text-sm text-slate-500 italic">Selectează literele din rack și apoi poziționează-le pe tablă.</p>
                     </div>
                 </div>
             </aside>
