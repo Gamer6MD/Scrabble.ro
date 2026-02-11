@@ -21,33 +21,36 @@ if firebase_config_raw:
     try:
         firebase_config = json.loads(firebase_config_raw)
     except Exception as e:
-        logging.error(f"Eroare critica la parsarea __firebase_config: {e}. Valoare primita: {firebase_config_raw[:20]}...")
+        logging.error(f"Eroare la parsarea __firebase_config: {e}")
 
 # Initializam Firebase Admin
 db = None
 try:
     if not firebase_admin._apps:
-        if service_account_raw and service_account_raw.startswith('{'):
-            # Metoda sigura: Service Account
+        # Prioritate 1: Service Account explicit (cel mai sigur pentru scriere)
+        if service_account_raw and (service_account_raw.startswith('{') or service_account_raw.startswith('[')):
             try:
-                service_account_info = json.loads(service_account_raw)
+                # Curatare suplimentara pentru caractere ascunse
+                clean_json = service_account_raw.replace('\n', '').replace('\r', '')
+                service_account_info = json.loads(clean_json)
                 cred = credentials.Certificate(service_account_info)
                 firebase_admin.initialize_app(cred)
-                logging.info("Firebase Admin: Initializat cu Service Account.")
+                logging.info("Firebase Admin: Initializat cu succes via Service Account.")
             except Exception as e:
-                logging.error(f"Eroare la incarcarea Service Account: {e}")
-        
-        # Daca inca nu e initializat, incercam cu Project ID
+                logging.error(f"Eroare la incarcarea Service Account JSON: {e}")
+
+        # Prioritate 2: Daca nu avem Service Account, folosim Project ID (doar pt Read de obicei)
         if not firebase_admin._apps:
             project_id = firebase_config.get("projectId")
             if project_id:
                 firebase_admin.initialize_app(options={'projectId': project_id})
-                logging.info(f"Firebase Admin: Initializat cu Project ID: {project_id}")
+                logging.info(f"Firebase Admin: Initializat via Project ID: {project_id}")
             else:
-                # Ultima incercare: cautare implicita a mediului
+                # Fallback final: Application Default Credentials (da eroare pe Vercel de obicei)
                 firebase_admin.initialize_app()
-                logging.info("Firebase Admin: Initializat implicit.")
+                logging.info("Firebase Admin: Initializat via implicit (ADC).")
     
+    # Obtinem clientul Firestore
     db = firestore.client()
 except Exception as e:
     logging.error(f"Eroare generala initializare Firebase: {e}")
@@ -63,6 +66,7 @@ LETTER_DISTRIBUTION = {
 
 def get_session_doc(session_id):
     if not db: return None
+    # Structura: /artifacts/scrabble-ro/public/data/sessions/{session_id}
     return db.collection('artifacts').document(app_id).collection('public').document('data').collection('sessions').document(session_id)
 
 def create_initial_state(player_name, player_id):
@@ -94,7 +98,7 @@ def create_initial_state(player_name, player_id):
 @app.route('/api/session/create', methods=['POST'])
 def create_session():
     if not db:
-        return jsonify({"error": "Baza de date neinitializata. Verificati log-urile serverului pentru detalii de conectare."}), 500
+        return jsonify({"error": "Baza de date neinitializata. Verificati configuratia Firebase."}), 500
         
     try:
         data = request.json or {}
@@ -106,8 +110,8 @@ def create_session():
         get_session_doc(session_id).set(state)
         return jsonify({"session_id": session_id, "player_id": player_id})
     except Exception as e:
-        logging.error(f"Eroare la crearea sesiunii in Firestore: {e}")
-        return jsonify({"error": "Eroare la scrierea in baza de date. Verificati permisiunile Service Account."}), 500
+        logging.error(f"Eroare la scrierea in Firestore: {e}")
+        return jsonify({"error": f"Eroare la scrierea in baza de date: {str(e)}"}), 500
 
 @app.route('/api/session/join', methods=['POST'])
 def join_session():
