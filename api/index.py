@@ -3,6 +3,7 @@ import json
 import uuid
 import random
 import logging
+import re
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -23,6 +24,25 @@ if firebase_config_raw:
     except Exception as e:
         logging.error(f"Eroare la parsarea __firebase_config: {e}")
 
+def clean_service_account_json(raw_json):
+    """Curăță și procesează JSON-ul Service Account pentru a evita erori de parsare."""
+    cleaned = raw_json.strip()
+    
+    # Elimină ghilimelele exterioare dacă există
+    if cleaned.startswith('"') and cleaned.endswith('"'):
+        cleaned = cleaned[1:-1]
+    
+    # Înlocuiește secvențele de escape pentru newline-uri
+    cleaned = cleaned.replace('\\\\n', '\n').replace('\\n', '\n')
+    
+    # Elimină alte caractere de control problematice (tab-uri, carriage returns)
+    cleaned = cleaned.replace('\\t', '\t').replace('\t', ' ')
+    
+    # Curăță caracterele de control rămase (doar permite spatiu, newline, tab)
+    cleaned = re.sub(r'[\x00-\x09\x0B-\x0C\x0E-\x1F\x7F]', '', cleaned)
+    
+    return cleaned
+
 # Initializam Firebase Admin
 db = None
 try:
@@ -30,26 +50,25 @@ try:
         # Prioritate maxima: Initializare prin Service Account JSON string
         if service_account_raw:
             try:
-                # Curatam orice reziduu de caractere de control sau ghilimele exterioare
-                clean_json = service_account_raw.strip()
-                if clean_json.startswith('"') and clean_json.endswith('"'):
-                    clean_json = clean_json[1:-1]
-                
-                # Reparam newline-urile din private_key (Vercel le poate strica la salvare)
-                clean_json = clean_json.replace('\\\\n', '\n').replace('\\n', '\n')
+                clean_json = clean_service_account_json(service_account_raw)
+                logging.info(f"JSON curatat (primele 100 caractere): {clean_json[:100]}...")
                 
                 cert_dict = json.loads(clean_json)
+                logging.info(f"Service Account parsat cu succes pentru proiectul: {cert_dict.get('project_id')}")
                 
                 # Validam existenta campurilor critice
                 if all(k in cert_dict for k in ['project_id', 'private_key', 'client_email']):
-                    # Forțăm repararea cheii private în interiorul obiectului
-                    cert_dict['private_key'] = cert_dict['private_key'].replace('\\n', '\n')
-                    
                     cred = credentials.Certificate(cert_dict)
                     firebase_admin.initialize_app(cred)
                     logging.info(f"Firebase Admin: Initializat cu succes via Service Account pentru proiectul: {cert_dict.get('project_id')}")
                 else:
-                    logging.error("Service Account JSON incomplet (lipsesc campuri cheie).")
+                    logging.error("Service Account JSON incomplet (lipsesc campuri cheie)." +
+                                 f" Campuri prezente: {list(cert_dict.keys())}")
+            except json.JSONDecodeError as e:
+                logging.error(f"Eroare JSONDecodeError la parsarea Service Account: {e} la pozitia {e.pos}")
+                # Încearcă să găsim și să eliminăm caracterul problematic
+                if e.pos < len(service_account_raw):
+                    logging.error(f"Caracterul problematic: '{service_account_raw[e.pos-5:e.pos+5]}'")
             except Exception as e:
                 logging.error(f"Eroare la procesarea Service Account JSON: {e}")
 
