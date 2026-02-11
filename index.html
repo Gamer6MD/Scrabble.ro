@@ -107,6 +107,16 @@
         function renderGame() {
             if (!gameState) return;
             
+            // Convertim board-ul din map în matrice 15x15
+            let boardMatrix = [];
+            for (let i = 0; i < 15; i++) {
+                let row = [];
+                for (let j = 0; j < 15; j++) {
+                    row.push(gameState.board[`${i}_${j}`] || null);
+                }
+                boardMatrix.push(row);
+            }
+            
             // Randare scoruri
             const playersEl = document.getElementById('players-list');
             playersEl.innerHTML = Object.values(gameState.players)
@@ -120,7 +130,7 @@
             // Randare tabla (Simplificata)
             const boardEl = document.getElementById('board');
             boardEl.innerHTML = '';
-            gameState.board.forEach((row, rIdx) => {
+            boardMatrix.forEach((row, rIdx) => {
                 row.forEach((cell, cIdx) => {
                     const cellDiv = document.createElement('div');
                     cellDiv.className = "w-full h-full border border-gray-400 flex items-center justify-center bg-white text-xs sm:text-sm font-bold aspect-square";
