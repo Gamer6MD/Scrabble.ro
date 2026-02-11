@@ -32,13 +32,13 @@ def clean_service_account_json(raw_json):
     if cleaned.startswith('"') and cleaned.endswith('"'):
         cleaned = cleaned[1:-1]
     
-    # Înlocuiește secvențele de escape pentru newline-uri
-    cleaned = cleaned.replace('\\\\n', '\n').replace('\\n', '\n')
+    # PROBLEMA: Vercel trimite newline-uri reale în JSON, ceea ce invalidează JSON-ul
+    # SOLUTIE: Transformăm newline-urile reale în secvențe escape \n
+    # Mai întâi, eliminăm orice newline real din afara string-urilor
+    cleaned = re.sub(r'(?<!\\)\n', r'\\n', cleaned)
+    cleaned = cleaned.replace('\\\\n', '\\n')  # Corectează double-escaping
     
-    # Elimină alte caractere de control problematice (tab-uri, carriage returns)
-    cleaned = cleaned.replace('\\t', '\t').replace('\t', ' ')
-    
-    # Curăță caracterele de control rămase (doar permite spatiu, newline, tab)
+    # Elimină alte caractere de control problematice
     cleaned = re.sub(r'[\x00-\x09\x0B-\x0C\x0E-\x1F\x7F]', '', cleaned)
     
     return cleaned
